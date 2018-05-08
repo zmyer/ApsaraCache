@@ -138,6 +138,10 @@ client *createClient(int fd) {
     listSetMatchMethod(c->pubsub_patterns,listMatchObjects);
     if (fd != -1) c->client_list_node = listAddNodeTailReturnNode(server.clients,c);
     initClientMultiState(c);
+
+    /* opget */
+    initExtraClientState(c);
+
     return c;
 }
 
@@ -786,6 +790,8 @@ void freeClient(client *c) {
      * some unexpected state, by checking its flags. */
     if (server.master && c->flags & CLIENT_MASTER) {
         serverLog(LL_WARNING,"Connection with master lost.");
+        revertOpidIfNeeded();
+        activeFullResyncOnProtocolErr(c);
         if (!(c->flags & (CLIENT_CLOSE_AFTER_REPLY|
                           CLIENT_CLOSE_ASAP|
                           CLIENT_BLOCKED|
@@ -800,6 +806,11 @@ void freeClient(client *c) {
     if ((c->flags & CLIENT_SLAVE) && !(c->flags & CLIENT_MONITOR)) {
         serverLog(LL_WARNING,"Connection with slave %s lost.",
             replicationGetSlaveName(c));
+        /* clean aof psync stat when slave is freed */
+        if (server.aof_psync_slave_offset &&
+            server.aof_psync_slave_offset->c == c) {
+            resetAofPsyncState();
+        }
     }
 
     /* Free the query buffer */
@@ -867,6 +878,9 @@ void freeClient(client *c) {
     zfree(c->argv);
     freeClientMultiState(c);
     sdsfree(c->peerid);
+    if (c->flags & REDIS_OPGET_CLIENT) {
+        cleanOpGetClientState(c->opget_client_state, c);
+    }
     zfree(c);
 }
 
@@ -1034,6 +1048,7 @@ void resetClient(client *c) {
      * to the next command will be sent, but set the flag if the command
      * we just processed was "CLIENT REPLY SKIP". */
     c->flags &= ~CLIENT_REPLY_SKIP;
+    c->flags &= ~CLIENT_NO_REPLY;
     if (c->flags & CLIENT_REPLY_SKIP_NEXT) {
         c->flags |= CLIENT_REPLY_SKIP;
         c->flags &= ~CLIENT_REPLY_SKIP_NEXT;
@@ -1136,6 +1151,7 @@ void setProtocolError(const char *errstr, client *c, int pos) {
         sdsfree(client);
     }
     c->flags |= CLIENT_CLOSE_AFTER_REPLY;
+    c->flags |= REDIS_PROTOCOL_ERROR;
     sdsrange(c->querybuf,pos,-1);
 }
 
@@ -1327,6 +1343,8 @@ void processInputBuffer(client *c) {
         /* Immediately abort if the client is in the middle of something. */
         if (c->flags & CLIENT_BLOCKED) break;
 
+        if (checkOpgetClientWaitingBioState(c) == C_OK) return;
+
         /* CLIENT_CLOSE_AFTER_REPLY closes the connection once the reply is
          * written to the client. Make sure to not let the reply grow after
          * this flag has been set (i.e. don't process more commands).
@@ -1440,6 +1458,7 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
         processInputBuffer(c);
     } else {
         size_t prev_offset = c->reploff;
+        uint64_t prev_flags = c->flags;
         processInputBuffer(c);
         size_t applied = c->reploff - prev_offset;
         if (applied) {
@@ -1447,6 +1466,8 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
                     c->pending_querybuf, applied);
             sdsrange(c->pending_querybuf,applied,-1);
         }
+
+        aofPsyncReplOffPostSet(c, prev_flags, applied);
     }
 }
 
@@ -1510,6 +1531,10 @@ sds catClientInfoString(sds s, client *client) {
     char flags[16], events[3], *p;
     int emask;
 
+    if (client->flags & REDIS_FAKECLIENT) {
+        return genFakeClientInfo(client, s);
+    }
+
     p = flags;
     if (client->flags & CLIENT_SLAVE) {
         if (client->flags & CLIENT_MONITOR)
@@ -1535,7 +1560,7 @@ sds catClientInfoString(sds s, client *client) {
     if (emask & AE_WRITABLE) *p++ = 'w';
     *p = '\0';
     return sdscatfmt(s,
-        "id=%U addr=%s fd=%i name=%s age=%I idle=%I flags=%s db=%i sub=%i psub=%i multi=%i qbuf=%U qbuf-free=%U obl=%U oll=%U omem=%U events=%s cmd=%s",
+        "id=%U addr=%s fd=%i name=%s age=%I idle=%I flags=%s db=%i sub=%i psub=%i multi=%i qbuf=%U qbuf-free=%U obl=%U oll=%U omem=%U events=%s cmd=%s next_opid=%i",
         (unsigned long long) client->id,
         getClientPeerId(client),
         client->fd,
@@ -1553,7 +1578,9 @@ sds catClientInfoString(sds s, client *client) {
         (unsigned long long) listLength(client->reply),
         (unsigned long long) getClientOutputBufferMemoryUsage(client),
         events,
-        client->lastcmd ? client->lastcmd->name : "NULL");
+        client->lastcmd ? client->lastcmd->name : "NULL",
+        (client->opget_client_state == NULL ?
+        -1 : client->opget_client_state->next_start_opid));
 }
 
 sds getAllClientsInfoString(void) {
